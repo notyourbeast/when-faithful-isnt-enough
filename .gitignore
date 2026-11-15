@@ -1,0 +1,36 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.venv/
+venv/
+
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+
+# Local datasets, model weights and experiment outputs
+data/
+models/
+outputs/
+runs/
+artifacts/
+cache/
+*.safetensors
+*.pt
+*.pth
+*.gguf
+
+# OS and editor state
+.DS_Store
+.vscode/
+*.log
