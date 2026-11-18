@@ -1,10 +1,12 @@
-"""Build resumable C1 FAISS shards for the prepared study corpora."""
+"""Build resumable chunking-arm FAISS shards for the prepared study corpora."""
 import argparse
+from collections import Counter
 from dataclasses import asdict
 import hashlib
 from importlib.metadata import version
 from itertools import islice
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -15,9 +17,10 @@ import numpy as np
 import torch
 from tokenizers import Tokenizer
 
-from check_medcpt_faiss import MODEL_REVISIONS, encode, load_model
+from check_medcpt_faiss import MODEL_REVISIONS, encode, load_model, semantic_documents
 from check_retrieval_corpora import build_chunks
 from retrieval_fixture import TOKENIZER_SHA256
+from semantic_chunking import build_semantic_spans
 
 
 FAISS_WRITER = """
@@ -58,16 +61,33 @@ def write(path, obj):
     temporary.replace(path)
 
 
-def build_shard(dataset, records, tokenizer, article_encoder, target):
+def build_shard(dataset, records, tokenizer, article_encoder, target, arm, calibration):
     rows = {row["pmid"]: row for row in records}
     if len(rows) != len(records):
         raise ValueError("Repeated PMID in shard")
-    source, chunks_by_pmid = build_chunks(dataset, rows, tokenizer)
+    stats = Counter()
+    semantic_spans = None
+    if arm == "c3":
+        field = "abstract" if dataset == "bioasq" else "text"
+        docs = dict(zip(rows, semantic_documents(
+            [row[field] for row in rows.values()], tokenizer, article_encoder), strict=True))
+
+        def semantic_spans(pmid, field):
+            spans, counts = build_semantic_spans(pmid, field, docs[pmid], calibration)
+            stats.update(counts)
+            return spans
+
+    source, chunks_by_pmid = build_chunks(dataset, rows, tokenizer, arm, stats, semantic_spans)
     chunks = [chunk for column in chunks_by_pmid.values() for chunk in column]
     if not chunks:
         raise ValueError("Shard has no indexable text")
     bodies = ["".join(source[s.pmid, s.field][s.start:s.end] for s in chunk.spans if s.field != "title")
               for chunk in chunks]
+    lengths = Counter()
+    if arm != "c1":
+        lengths.update(len(tokens.ids) for tokens in tokenizer.encode_batch(bodies, add_special_tokens=False))
+        if max(lengths) > (128 if arm == "c2" else 192):
+            raise ValueError("Chunk body exceeds arm token limit")
     if dataset == "bioasq":
         titles = [source.get((chunk.spans[0].pmid, "title"), "") for chunk in chunks]
         vectors = encode(titles, *article_encoder, 512, pairs=bodies)
@@ -82,10 +102,10 @@ def build_shard(dataset, records, tokenizer, article_encoder, target):
                 output.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
         (stage / "index.faiss").replace(target / "index.faiss")
         (stage / "chunks.jsonl").replace(target / "chunks.jsonl")
-    return len(chunks)
+    return len(chunks), {"chunker_counts": dict(stats), "body_token_histogram": dict(lengths)}
 
 
-def build_dataset(root, dataset, args, tokenizer, encoder, model_hash):
+def build_dataset(root, dataset, args, tokenizer, encoder, model_hash, calibration):
     prepared = root / "outputs" / dataset / "prepared"
     corpus = prepared / "corpus.jsonl"
     manifest = read(prepared / "manifest.json")
@@ -94,10 +114,10 @@ def build_dataset(root, dataset, args, tokenizer, encoder, model_hash):
         expected_count = sum(section["retained"] for section in manifest["counts"].values())
     if sha(corpus) != manifest["corpus_sha256"]:
         raise ValueError(f"Prepared {dataset} corpus checksum mismatch")
-    target = root / "outputs" / "retrieval" / "full_indexes" / "c1" / dataset
+    target = root / "outputs" / "retrieval" / "full_indexes" / args.arm / dataset
     target.mkdir(parents=True, exist_ok=True)
     settings = {
-        "dataset": dataset, "arm": "c1", "corpus_sha256": manifest["corpus_sha256"],
+        "dataset": dataset, "arm": args.arm, "corpus_sha256": manifest["corpus_sha256"],
         "documents_total": expected_count, "documents_per_shard": args.shard_docs,
         "model_revision": MODEL_REVISIONS["article"], "model_sha256": model_hash,
         "tokenizer_sha256": TOKENIZER_SHA256["medcpt"], "encoder_cap": 512,
@@ -106,6 +126,16 @@ def build_dataset(root, dataset, args, tokenizer, encoder, model_hash):
         "index": "IndexFlatIP", "faiss_version": version("faiss-cpu"),
         "transformers_version": version("transformers"), "tokenizers_version": version("tokenizers"),
     }
+    if args.arm == "c2":
+        settings["sentence_splitter_sha256"] = sha(Path(__file__).with_name("sentence_packing.py"))
+        settings["fragmentation_fallback_sha256"] = sha(Path(__file__).with_name("c2_sentence_packing.py"))
+    if args.arm == "c3":
+        settings.pop("window_tokens")
+        settings.update(
+            sentence_splitter_sha256=sha(Path(__file__).with_name("sentence_packing.py")),
+            semantic_chunker_sha256=sha(Path(__file__).with_name("semantic_chunking.py")),
+            calibration=calibration, minimum_body_tokens=64, maximum_body_tokens=192,
+        )
     if (target / "settings.json").exists() and read(target / "settings.json") != settings:
         raise ValueError(f"Existing {dataset} shards use different settings")
     write(target / "settings.json", settings)
@@ -114,6 +144,7 @@ def build_dataset(root, dataset, args, tokenizer, encoder, model_hash):
     new_seconds = 0.0
     new_documents = 0
     new_bytes = 0
+    new_checkpoint_bytes = 0
     with corpus.open("rb") as source:
         for number in range((expected_count + args.shard_docs - 1) // args.shard_docs):
             lines = list(islice(source, args.shard_docs))
@@ -132,19 +163,26 @@ def build_dataset(root, dataset, args, tokenizer, encoder, model_hash):
             else:
                 if args.max_new_shards is not None and new >= args.max_new_shards:
                     break
+                if shutil.disk_usage(target).free < args.min_free_mib * 1024**2:
+                    raise OSError(f"Free disk space below {args.min_free_mib} MiB; existing checkpoints are intact")
                 shard.mkdir(exist_ok=True)
                 start = perf_counter()
-                count = build_shard(dataset, [json.loads(line) for line in lines], tokenizer, encoder, shard)
+                count, details = build_shard(dataset, [json.loads(line) for line in lines],
+                                             tokenizer, encoder, shard, args.arm, calibration)
                 elapsed = perf_counter() - start
                 saved = {"rows_sha256": fingerprint, "documents": len(lines), "chunks": count,
                          "index_sha256": sha(shard / "index.faiss"), "chunks_sha256": sha(shard / "chunks.jsonl"),
                          "index_bytes": (shard / "index.faiss").stat().st_size, "elapsed_seconds": elapsed}
+                if args.arm != "c1":
+                    saved.update(details)
                 write(checkpoint, saved)
                 new += 1
                 new_seconds += elapsed
                 new_documents += len(lines)
                 new_bytes += saved["index_bytes"]
-                print(f"{dataset} shard {number}: {len(lines)} documents, {count} chunks, {elapsed:.1f}s", flush=True)
+                new_checkpoint_bytes += sum((shard / name).stat().st_size
+                                            for name in ("index.faiss", "chunks.jsonl", "manifest.json"))
+                print(f"{args.arm} {dataset} shard {number}: {len(lines)} documents, {count} chunks, {elapsed:.1f}s", flush=True)
             documents += saved["documents"]
             chunks += saved["chunks"]
         if documents == expected_count and source.read(1):
@@ -158,6 +196,7 @@ def build_dataset(root, dataset, args, tokenizer, encoder, model_hash):
             "new_documents": new_documents, "seconds": new_seconds,
             "linear_full_build_hours": expected_count * new_seconds / new_documents / 3600,
             "linear_full_index_bytes": round(expected_count * new_bytes / new_documents),
+            "linear_full_checkpoint_bytes": round(expected_count * new_checkpoint_bytes / new_documents),
             "caveat": "Extrapolation from the measured shards in corpus order. Document lengths vary.",
         }
     elif (target / "progress.json").exists():
@@ -176,7 +215,14 @@ def main():
     parser.add_argument("--max-new-shards", type=int)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--model-dir", type=Path, help="Local copy of the pinned article encoder")
+    parser.add_argument("--arm", choices=("c1", "c2", "c3"), default="c1")
+    parser.add_argument("--calibration-report", type=Path, help="Saved pilot-only C3 calibration report")
+    parser.add_argument("--min-free-mib", type=int, default=0)
     args = parser.parse_args()
+    if args.min_free_mib < 0:
+        parser.error("Minimum free space must be non-negative")
+    if args.calibration_report is not None and args.arm != "c3":
+        parser.error("--calibration-report requires --arm c3")
     if args.shard_docs < 1 or args.threads < 1 or (args.max_new_shards is not None and args.max_new_shards < 0):
         parser.error("Invalid shard or thread count")
     torch.set_num_threads(args.threads)
@@ -190,10 +236,24 @@ def main():
     model_hash = sha(model / "model.safetensors")
     if model_hash != baseline["weights_sha256"]["article"]:
         raise ValueError("Article weights differ from the verified fixture")
+    calibration = None
+    if args.arm == "c3":
+        path = args.calibration_report or args.project / "outputs/retrieval/medcpt_faiss_fixture_c3.json"
+        report = read(path)
+        calibration = report["calibration"]["selected"]
+        if (report["strategy"] != "c3" or not calibration["within_target"]
+                or report["weights_sha256"]["article"] != model_hash
+                or not report["calibration"]["pilot_document_ids"]
+                or report["tokenizer_sha256"]["medcpt"] != TOKENIZER_SHA256["medcpt"]):
+            raise ValueError("C3 calibration does not match the verified model, tokenizer or pilot")
+        for dataset in args.dataset:
+            manifest = read(args.project / "outputs" / dataset / "prepared/manifest.json")
+            if report["corpus_sha256"][dataset] != manifest["corpus_sha256"]:
+                raise ValueError(f"C3 calibration corpus differs: {dataset}")
     encoder = load_model(model)
     tokenizer = Tokenizer.from_file(str(token_path))
     for dataset in dict.fromkeys(args.dataset):
-        build_dataset(args.project, dataset, args, tokenizer, encoder, model_hash)
+        build_dataset(args.project, dataset, args, tokenizer, encoder, model_hash, calibration)
 
 
 if __name__ == "__main__":

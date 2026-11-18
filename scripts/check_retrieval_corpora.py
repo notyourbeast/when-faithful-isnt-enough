@@ -8,7 +8,7 @@ from pathlib import Path
 from tokenizers import Tokenizer
 
 from reference_arms import whole_document_spans
-from sentence_packing import pack_sentences
+from c2_sentence_packing import pack_sentences
 
 from retrieval_fixture import (
     CONTEXT_BUDGET, RANK_LIMIT, TOKENIZER_SHA256, Chunk, Span,
